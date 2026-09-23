@@ -399,6 +399,52 @@ return [
     'auth_u2f_enabledfield' => '',
 
 
+    /************************** OTP (two-factor via e-mail) *********************************/
+
+    /*
+     * Enable or disable the two-factor authentication with a one-time password sent by e-mail
+     */
+    'auth_enable_otp' => false,
+
+    /*
+     * The user field (boolean) that enables the OTP for the user.
+     * Users with this field set log in with user / password + OTP, the others with the standard login.
+     */
+    'auth_otp_enabledfield' => 'otp_enabled',
+
+    /*
+     * The user field that contains the e-mail address the OTP is sent to.
+     * Users enabled to the OTP without a valid e-mail address cannot log in.
+     */
+    'auth_otp_emailfield' => 'email',
+
+    /*
+     * Number of digits of the OTP
+     */
+    'auth_otp_length' => 6,
+
+    /*
+     * Validity of the OTP, in seconds
+     */
+    'auth_otp_lifetime' => 300,
+
+    /*
+     * Maximum number of wrong OTPs before the login has to be repeated
+     */
+    'auth_otp_maxattempts' => 5,
+
+    /*
+     * Sender of the OTP e-mail
+     */
+    'auth_otp_mailfrom' => '',
+
+    /*
+     * Optional callable used to send the OTP e-mail: function (string $to, string $subject, string $body, array $user): bool
+     * If empty, PHP's mail() function is used.
+     */
+    'auth_otp_mailer' => null,
+
+
     /***************************** LDAP settings *******************************/
     /*
      * To use LDAP you should fill this config_variables with the right values

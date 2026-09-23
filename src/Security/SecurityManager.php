@@ -137,6 +137,16 @@ class SecurityManager
             $this->u2fAuthenticate($auth_user, $ATK_VARS['u2f_response']);
         }
 
+        // otp verification?
+        if (Config::getGlobal('auth_enable_otp') && $this->auth_response === self::AUTH_UNVERIFIED && isset($session['otp_pending'])) {
+            if ($auth_user) {
+                // a new login has been submitted: discard the pending verification
+                unset($session['otp_pending']);
+            } else {
+                $auth_rememberme = $this->otpVerify();
+            }
+        }
+
         // try a standard login with user / password
         if ($this->auth_response === self::AUTH_UNVERIFIED) {
             if ($auth_user || $isCli) {
@@ -149,6 +159,10 @@ class SecurityManager
                     $this->u2fAuthenticationForm($auth_user, $auth_rememberme);
                     exit;
                 }
+            }
+
+            if ($this->auth_response === self::AUTH_SUCCESS && $this->otpRequired($this->m_user)) {
+                $this->otpStart($auth_rememberme);
             }
         }
 
@@ -883,6 +897,218 @@ class SecurityManager
         $page->register_script(Config::getGlobal('assets_url') . 'javascript/u2f-api.js');
         $page->addContent($result);
         $output->output($page->render(Tools::atktext('app_title')));
+        $output->outputFlush();
+        exit;
+    }
+
+
+    /****** OTP ******/
+
+    /**
+     * Is the OTP verification required for the given user?
+     * Only users with the auth_otp_enabledfield set use the OTP, the others use the standard login.
+     * The OTP is only supported with the login form (not with the HTTP login).
+     *
+     * @param array $user
+     * @return bool
+     */
+    protected function otpRequired($user)
+    {
+        if (!Config::getGlobal('auth_enable_otp') || !Config::getGlobal('auth_loginform') || php_sapi_name() === 'cli') {
+            return false;
+        }
+
+        $otp_enabledfield = Config::getGlobal('auth_otp_enabledfield');
+
+        return $otp_enabledfield && !empty($user[$otp_enabledfield]);
+    }
+
+    /**
+     * The user and password have been verified: keep the user pending, send the OTP and show the OTP form.
+     *
+     * @param string $auth_rememberme
+     */
+    private function otpStart($auth_rememberme)
+    {
+        $session = &SessionManager::getSession();
+
+        // the user is not authenticated until the OTP is verified
+        $session['otp_pending'] = [
+            'user' => $this->m_user,
+            'rememberme' => $auth_rememberme,
+            'attempts' => 0,
+        ];
+        $this->m_user = null;
+        $this->auth_response = self::AUTH_UNVERIFIED;
+
+        if (!$this->otpSend($session['otp_pending'])) {
+            $this->otpFail($session['otp_pending']['user']['name'], $this->m_fatalError);
+            return;
+        }
+
+        $this->otpForm();
+    }
+
+    /**
+     * Verify the OTP submitted by the user (or send a new one).
+     * On success the pending user becomes the authenticated user.
+     *
+     * @return string the remember me value of the original login
+     */
+    private function otpVerify()
+    {
+        global $ATK_VARS;
+
+        $session = &SessionManager::getSession();
+        $pending = &$session['otp_pending'];
+        $username = $pending['user']['name'];
+
+        if (time() > $pending['expires']) {
+            $this->otpFail($username, Tools::atktext('otp_error_expired'));
+            return '';
+        }
+
+        // a resend request counts as an attempt, to avoid flooding the user's mailbox
+        if (!empty($ATK_VARS['otp_resend'])) {
+            if (++$pending['attempts'] >= Config::getGlobal('auth_otp_maxattempts')) {
+                $this->otpFail($username, Tools::atktext('otp_error_maxattempts'));
+                return '';
+            }
+            if (!$this->otpSend($pending)) {
+                $this->otpFail($username, $this->m_fatalError);
+                return '';
+            }
+            $this->otpForm('', Tools::atktext('otp_resent'));
+        }
+
+        $otp = isset($ATK_VARS['auth_otp']) ? trim($ATK_VARS['auth_otp']) : '';
+        if ($otp === '') {
+            // e.g. the page has been reloaded
+            $this->otpForm();
+        }
+
+        if (password_verify($otp, $pending['hash'])) {
+            Tools::atkdebug('SecurityManager: OTP verified / user = ' . $username);
+            $this->m_user = $pending['user'];
+            $this->auth_response = self::AUTH_SUCCESS;
+            $auth_rememberme = $pending['rememberme'];
+            unset($session['otp_pending']);
+
+            // new session id for the authenticated user (prevents session fixation)
+            if (session_status() === PHP_SESSION_ACTIVE && !headers_sent()) {
+                session_regenerate_id(true);
+            }
+
+            return $auth_rememberme;
+        }
+
+        $this->notifyListeners('errorLogin', $username, ['auth_response' => self::AUTH_MISMATCH, 'otp' => true]);
+
+        if (++$pending['attempts'] >= Config::getGlobal('auth_otp_maxattempts')) {
+            $this->otpFail($username, Tools::atktext('otp_error_maxattempts'));
+            return '';
+        }
+
+        $this->otpForm(Tools::atktext('otp_error_mismatch'));
+    }
+
+    /**
+     * Abort the pending verification: the user has to log in again.
+     *
+     * @param string $username
+     * @param string $error
+     */
+    private function otpFail($username, $error)
+    {
+        $session = &SessionManager::getSession();
+        unset($session['otp_pending']);
+
+        $this->m_user = null;
+        $this->auth_response = self::AUTH_ERROR;
+        $this->m_fatalError = $error;
+        $this->notifyListeners('errorLogin', $username, ['auth_response' => $this->auth_response, 'fatal_error' => $error, 'otp' => true]);
+    }
+
+    /**
+     * Generate a new OTP, store its hash in the pending verification and send it by e-mail.
+     * On failure m_fatalError is set.
+     *
+     * @param array $pending
+     * @return bool
+     */
+    private function otpSend(&$pending)
+    {
+        $user = $pending['user'];
+        $emailfield = Config::getGlobal('auth_otp_emailfield');
+        $to = isset($user[$emailfield]) ? trim($user[$emailfield]) : '';
+        if (!filter_var($to, FILTER_VALIDATE_EMAIL)) {
+            $this->m_fatalError = Tools::atktext('otp_error_noemail');
+            return false;
+        }
+
+        $length = (int)Config::getGlobal('auth_otp_length');
+        $lifetime = (int)Config::getGlobal('auth_otp_lifetime');
+        $otp = str_pad((string)random_int(0, (int)pow(10, $length) - 1), $length, '0', STR_PAD_LEFT);
+
+        $pending['hash'] = password_hash($otp, PASSWORD_DEFAULT);
+        $pending['expires'] = time() + $lifetime;
+
+        $subject = Tools::atktext('app_title') . ' - ' . Tools::atktext('otp_mail_subject');
+        $body = str_replace(['{otp}', '{minutes}'], [$otp, (int)ceil($lifetime / 60)], Tools::atktext('otp_mail_body'));
+
+        try {
+            $mailer = Config::getGlobal('auth_otp_mailer');
+            if (is_callable($mailer)) {
+                $sent = (bool)call_user_func($mailer, $to, $subject, $body, $user);
+            } else {
+                $headers = "MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8";
+                $from = Config::getGlobal('auth_otp_mailfrom');
+                if ($from) {
+                    $headers .= "\r\nFrom: $from";
+                }
+                $sent = mail($to, '=?UTF-8?B?' . base64_encode($subject) . '?=', $body, $headers);
+            }
+        } catch (\Throwable $e) {
+            Tools::atkerror('SecurityManager: error sending the OTP e-mail: ' . $e->getMessage());
+            $sent = false;
+        }
+
+        if (!$sent) {
+            $this->m_fatalError = Tools::atktext('otp_error_send');
+            return false;
+        }
+
+        Tools::atkdebug('SecurityManager: OTP sent / user = ' . $user['name']);
+        return true;
+    }
+
+    /**
+     * Display the OTP form.
+     *
+     * @param string $error
+     * @param string $message
+     */
+    private function otpForm($error = '', $message = '')
+    {
+        $page = Page::getInstance();
+        $ui = Ui::getInstance();
+        $adminLte = AdminLTE::getInstance();
+
+        $tplvars = [];
+        $tplvars['atksessionformvars'] = Tools::makeHiddenPostvars(['atklogout', 'auth_user', 'auth_pw', 'auth_rememberme', 'u2f_response', 'auth_otp', 'otp_resend', 'login']);
+        $tplvars['formurl'] = Config::getGlobal('dispatcher');
+        $tplvars['otp_length'] = (int)Config::getGlobal('auth_otp_length');
+        if ($error != '') {
+            $tplvars['error'] = $error;
+        }
+        if ($message != '') {
+            $tplvars['message'] = $message;
+        }
+
+        $page->addContent($ui->render('otp.tpl', $tplvars));
+        $output = Output::getInstance();
+
+        $output->output($page->render(Tools::atktext('app_title'), Page::HTML_STRICT, '', $ui->render('login_meta.tpl'), $adminLte->getLoginClasses()));
         $output->outputFlush();
         exit;
     }
